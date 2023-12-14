@@ -167,8 +167,11 @@ do
     * @param {string} alias - The settings file alias to use for the file name.
     * @return {table} The loaded settings.
     --]]
-    load_settings = function (defaults, alias)
-        local file = ('%s\\%s.lua'):fmt(settingslib.settings_path(), alias);
+    load_settings = function (path, defaults, alias)
+        local file = ('%s\\%s.lua'):fmt(path, alias);
+        
+        -- Save the path being loaded for future writes..
+        settingslib.cache[alias].path = path;
 
         -- If no settings file exists; create a new default file..
         if (not ashita.fs.exists(file)) then
@@ -202,7 +205,17 @@ do
             return defaults:copy(true);
         end
 
-        return T(settings);
+        -- Cache loaded state to prevent unnecessary writes..
+        settings = T(settings);
+        settingslib.cache[alias].last_loaded_state = settings:copy(true);
+
+        -- Merge defaults to ensure settings are complete..
+        settings = T(settings):merge(defaults);
+
+        -- Save, so that any merged defaults make it to disc..
+        save_settings(settings, alias);
+
+        return settings;
     end
 
     --[[
@@ -213,11 +226,24 @@ do
     * @return {boolean} True on success, false otherwise.
     --]]
     save_settings = function (settings, alias)
+        -- Exit early if set to read only..
+        if (settings.read_only == true) then
+            return true;
+        end
+
+        -- Check if settings have changed since last load..
+        if (settings:equals(settingslib.cache[alias].last_loaded_state)) then
+            return true;
+        end
+
+        -- Get the path the settings were loaded from..
+        local path = settingslib.cache[alias].path;
+
         -- Create paths to the settings folder..
-        ashita.fs.create_dir(settingslib.settings_path());
+        ashita.fs.create_dir(path);
 
         -- Create path to the settings file..
-        local file = ('%s\\%s.lua'):fmt(settingslib.settings_path(), alias);
+        local file = ('%s\\%s.lua'):fmt(path, alias);
 
         -- Process the settings table for storage on disk..
         local p, s = process_settings(settings, 'settings');
@@ -235,6 +261,9 @@ do
         f:write(s);
         f:write('\nreturn settings;\n');
         f:close();
+
+        -- Update the cache so that future writes know the current state of file..
+        settingslib.cache[alias].last_loaded_state = settings:copy(true);
 
         return true;
     end
@@ -272,7 +301,9 @@ do
     process_character_switch = function (id, name)
         -- Save all current settings back to disk..
         for _, v in settingslib.cache:it() do
-            save_settings(v.settings, v.alias);
+            if (v.settings.disable_character_specific ~= true) then
+                save_settings(v.settings, v.alias);
+            end
         end
 
         -- Update the current login information..
@@ -282,19 +313,24 @@ do
 
         -- Reload all settings that are currently loaded for the new player..
         for _, v in settingslib.cache:it() do
-            local settings = load_settings(v.defaults, v.alias);
-            settings = settings:merge(v.defaults);
+            if (v.settings.disable_character_specific ~= true) then
+                local settings = load_settings(settingslib.settings_path(), v.defaults, v.alias);
 
-            -- Save the updated settings to ensure the data on disk matches the merged information..
-            save_settings(settings, v.alias);
+                -- Update the settings table..
+                settingslib.cache[v.alias].settings = settings;
 
-            -- Update the settings table..
-            settingslib.cache[v.alias].settings = settings;
-
-            -- Invoke callbacks registered for the settings changes..
-            raise_events(v.alias, settings);
+                -- Invoke callbacks registered for the settings changes..
+                raise_events(v.alias, settings);
+            end
         end
     end
+end
+
+--[[
+* Returns the current settings default path. (Returns the parent folder where settings would be located.)
+--]]
+settingslib.default_path = function ()
+    return ('%s\\config\\addons\\%s\\%s\\'):fmt(AshitaCore:GetInstallPath(), addon.name, 'defaults');
 end
 
 --[[
@@ -332,18 +368,21 @@ settingslib.load = function (defaults, alias)
     defaults = defaults or T{ };
     alias = alias or 'settings';
 
-    -- Load the settings and merge the defaults together ensuring the block has all expected information..
-    local settings = load_settings(defaults, alias);
-    settings = settings:merge(defaults);
-
-    -- Save the updated settings to ensure the data on disk matches the merged information..
-    save_settings(settings, alias);
-
-    -- Cache the settings information..
+    -- Create cache entry..
     settingslib.cache[alias] = settingslib.cache[alias] or T{ };
     settingslib.cache[alias].alias = alias;
     settingslib.cache[alias].defaults = defaults;
     settingslib.cache[alias].events = settingslib.cache[alias].events or T{ };
+
+    -- Load defaults from disc..
+    local settings = load_settings(settingslib.default_path(), defaults, alias);
+    
+    -- If character-specific settings are enabled, and character is logged in, attempt to load character-specific file..
+    if (settings.disable_character_specific ~= true) and (settingslib.logged_in and #settingslib.name > 0 and settingslib.server_id > 0) then
+        settings = load_settings(settingslib.settings_path(), settings, alias);
+    end
+
+    -- Cache the settings..
     settingslib.cache[alias].settings = settings;
 
     -- Invoke callbacks registered for the settings changes..
@@ -394,12 +433,8 @@ settingslib.reload = function (alias)
         return false;
     end
 
-    -- Load the settings and merge the defaults together ensuring the block has all expected information..
-    local settings = load_settings(settingslib.cache[alias].defaults, alias);
-    settings = settings:merge(settingslib.cache[alias].defaults);
-
-    -- Save the updated settings to ensure the data on disk matches the merged information..
-    save_settings(settings, alias);
+    -- Load the settings from disc..
+    local settings = load_settings(settingslib.cache[alias].path, settingslib.cache[alias].defaults, alias);
 
     --- Update the settings cache..
     settingslib.cache[alias].settings = settings;
